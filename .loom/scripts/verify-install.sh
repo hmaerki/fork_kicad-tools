@@ -103,7 +103,7 @@ ${BOLD}TRACKED FILE LOCATIONS:${NC}
     .github/labels.yml             Label definitions
     .github/ISSUE_TEMPLATE/*       Issue templates
     .github/workflows/*.yml        GitHub workflows
-    CLAUDE.md, .loom/AGENTS.md     Top-level docs
+    CLAUDE.md                       Top-level docs
     .loom/CLAUDE.md, .loom/README.md
     .codex/config.toml             Codex configuration
     loom                           CLI wrapper
@@ -190,9 +190,6 @@ collect_tracked_files() {
     if [[ -f "$root/CLAUDE.md" ]]; then
         files+=("CLAUDE.md")
     fi
-    if [[ -f "$root/.loom/AGENTS.md" ]]; then
-        files+=(".loom/AGENTS.md")
-    fi
     if [[ -f "$root/.loom/CLAUDE.md" ]]; then
         files+=(".loom/CLAUDE.md")
     fi
@@ -243,12 +240,14 @@ cmd_generate() {
     local generated_at
     generated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-    # Detect loom version from CLAUDE.md if possible
+    # Detect loom version from CLAUDE.md and commit from install-metadata.json
     local loom_version=""
     local loom_commit=""
     if [[ -f "$root/CLAUDE.md" ]]; then
         loom_version=$(grep -o 'Loom Version.*: .*' "$root/CLAUDE.md" | head -1 | sed 's/.*: //' | sed 's/\*//g' | tr -d '[:space:]' || true)
-        loom_commit=$(grep -o 'Loom Commit.*: .*' "$root/CLAUDE.md" | head -1 | sed 's/.*: //' | sed 's/\*//g' | tr -d '[:space:]' || true)
+    fi
+    if [[ -f "$root/.loom/install-metadata.json" ]]; then
+        loom_commit=$(grep -o '"loom_commit": "[^"]*"' "$root/.loom/install-metadata.json" | head -1 | sed 's/.*: "//; s/"//' || true)
     fi
 
     # Build JSON using printf (no jq dependency for generate)

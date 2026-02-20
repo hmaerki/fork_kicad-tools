@@ -127,7 +127,7 @@ list_logs() {
     if [[ "$found" == "false" ]]; then
         echo -e "${YELLOW}No log files found${NC}"
         echo ""
-        echo "Start agents with: ./loom start"
+        echo "Start agents with: ./.loom/bin/loom start"
     else
         echo ""
         echo -e "${CYAN}To view:${NC} loom logs <name>"
@@ -174,9 +174,11 @@ get_log_path() {
     return 1
 }
 
-# Strip ANSI escape codes (optional, for cleaner output)
+# Strip ANSI escape codes and terminal control characters for cleaner output.
+# Removes CSI sequences, OSC sequences, carriage returns, backspaces,
+# and bare escape sequences.
 strip_ansi() {
-    sed 's/\x1b\[[0-9;]*m//g'
+    sed -E 's/\x1b\[[?0-9;]*[a-zA-Z]//g; s/\x1b\][^\x07]*\x07//g; s/\r//g; s/\x08//g; s/\x1b[^][]//g'
 }
 
 # Main logic
@@ -251,7 +253,7 @@ main() {
 
         if [[ ${#log_files[@]} -eq 0 ]]; then
             echo -e "${YELLOW}No log files found${NC}" >&2
-            echo "Start agents with: ./loom start" >&2
+            echo "Start agents with: ./.loom/bin/loom start" >&2
             exit 1
         fi
 

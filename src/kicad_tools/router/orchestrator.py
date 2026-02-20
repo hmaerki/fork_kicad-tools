@@ -63,7 +63,7 @@ from .strategies import (
     RoutingStrategy,
 )
 from .subgrid import SubGridRouter
-from .via_conflict import ViaConflictManager
+from .via_conflict import ViaConflictManager, ViaConflictStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -345,6 +345,9 @@ class RoutingOrchestrator:
     def _has_via_conflicts(self, net: str | int, pads: list[Pad] | None) -> bool:
         """Check if there are existing via conflicts for this net.
 
+        Queries the ViaConflictManager to detect vias from other nets
+        that block access to this net's pads.
+
         Args:
             net: Net identifier
             pads: Optional list of pads
@@ -352,11 +355,31 @@ class RoutingOrchestrator:
         Returns:
             True if via conflicts detected
         """
-        # Placeholder - real implementation would check via manager
+        if pads is None or not pads:
+            return False
+
+        # Initialize via manager lazily if we have a grid
+        if self._via_manager is None:
+            grid = getattr(self.pcb, "grid", None)
+            if grid is None:
+                return False
+            self._via_manager = ViaConflictManager(grid=grid, rules=self.rules)
+
+        net_id = net if isinstance(net, int) else 0
+        for pad in pads:
+            conflicts = self._via_manager.find_blocking_vias(
+                pad=pad, pad_net=net_id
+            )
+            if conflicts:
+                return True
         return False
 
     def _route_global(self, net: str | int, pads: list[Pad] | None) -> RoutingResult:
         """Execute global routing strategy.
+
+        Uses the GlobalRouter to find a corridor assignment through the
+        region graph, then converts the result to a RoutingResult with
+        metrics computed from the corridor waypoints.
 
         Args:
             net: Net identifier
@@ -365,24 +388,57 @@ class RoutingOrchestrator:
         Returns:
             RoutingResult from global routing
         """
-        # Placeholder implementation
-        # Real implementation would instantiate and use GlobalRouter
+        if pads is None or len(pads) < 2:
+            return RoutingResult(
+                success=False,
+                net=net,
+                strategy_used=RoutingStrategy.GLOBAL_WITH_REPAIR,
+                error_message="Insufficient pads for global routing",
+            )
+
+        pad_positions = [(p.x, p.y) for p in pads]
+        net_id = net if isinstance(net, int) else abs(hash(str(net))) % 100000 + 1
+
+        assignment = self.global_router.route_net(net_id, pad_positions)
+
+        if assignment is None:
+            return RoutingResult(
+                success=False,
+                net=net,
+                strategy_used=RoutingStrategy.GLOBAL_WITH_REPAIR,
+                error_message="Global router failed to find corridor assignment",
+                alternative_strategies=self._suggest_alternatives(
+                    RoutingStrategy.GLOBAL_WITH_REPAIR
+                ),
+            )
+
+        # Calculate total length from corridor waypoints
+        total_length = 0.0
+        waypoints = assignment.waypoint_coords
+        for i in range(len(waypoints) - 1):
+            dx = waypoints[i + 1][0] - waypoints[i][0]
+            dy = waypoints[i + 1][1] - waypoints[i][1]
+            total_length += math.sqrt(dx * dx + dy * dy)
+
         return RoutingResult(
             success=True,
             net=net,
             strategy_used=RoutingStrategy.GLOBAL_WITH_REPAIR,
             metrics=RoutingMetrics(
-                total_length_mm=10.5,
-                via_count=2,
-                layer_changes=1,
+                total_length_mm=total_length,
+                via_count=0,
+                layer_changes=0,
             ),
-            warnings=["Global routing: placeholder implementation"],
         )
 
     def _route_escape_then_global(
         self, net: str | int, pads: list[Pad] | None
     ) -> RoutingResult:
         """Execute escape routing followed by global routing.
+
+        Phase 1: Uses EscapeRouter to generate escape routes for dense
+        packages, freeing inner pins for routing.
+        Phase 2: Uses GlobalRouter to route the remaining connections.
 
         Args:
             net: Net identifier
@@ -391,24 +447,68 @@ class RoutingOrchestrator:
         Returns:
             RoutingResult combining escape and global routing
         """
-        # Placeholder implementation
+        if pads is None or len(pads) < 2:
+            return RoutingResult(
+                success=False,
+                net=net,
+                strategy_used=RoutingStrategy.ESCAPE_THEN_GLOBAL,
+                error_message="Insufficient pads for escape routing",
+            )
+
+        escape_count = 0
+        escape_vias = 0
+        escape_segments_list: list = []
+        escape_vias_list: list = []
+
+        # Phase 1: Escape routing
+        if self._escape is None:
+            grid = getattr(self.pcb, "grid", None)
+            if grid is not None:
+                self._escape = EscapeRouter(grid=grid, rules=self.rules)
+
+        if self._escape is not None:
+            package_info = self._escape.analyze_package(pads)
+            if package_info.is_dense:
+                escape_routes = self._escape.generate_escapes(package_info)
+                escape_count = len(escape_routes)
+                for er in escape_routes:
+                    escape_segments_list.extend(er.segments)
+                    if er.via is not None:
+                        escape_vias_list.append(er.via)
+                        escape_vias += 1
+
+                logger.info(
+                    "Escape routing: %d escape routes generated (%d with vias)",
+                    escape_count,
+                    escape_vias,
+                )
+
+        # Phase 2: Global routing for remaining connections
+        global_result = self._route_global(net, pads)
+
+        # Merge escape + global results
         return RoutingResult(
-            success=True,
+            success=global_result.success,
             net=net,
             strategy_used=RoutingStrategy.ESCAPE_THEN_GLOBAL,
+            segments=escape_segments_list + global_result.segments,
+            vias=escape_vias_list + global_result.vias,
             metrics=RoutingMetrics(
-                total_length_mm=12.0,
-                via_count=3,
-                layer_changes=2,
-                escape_segments=4,
+                total_length_mm=global_result.metrics.total_length_mm,
+                via_count=global_result.metrics.via_count + escape_vias,
+                layer_changes=global_result.metrics.layer_changes + escape_vias,
+                escape_segments=escape_count,
             ),
-            warnings=["Escape routing: placeholder implementation"],
         )
 
     def _route_hierarchical(
         self, net: str | int, intent: NetIntent | None, pads: list[Pad] | None
     ) -> RoutingResult:
         """Execute hierarchical routing for differential pairs.
+
+        Uses AdaptiveAutorouter which automatically discovers the optimal
+        layer count and routes using negotiated congestion resolution.
+        Differential pair intent is passed through to guide routing.
 
         Args:
             net: Net identifier
@@ -418,17 +518,90 @@ class RoutingOrchestrator:
         Returns:
             RoutingResult from hierarchical routing
         """
-        # Placeholder implementation
+        if pads is None or len(pads) < 2:
+            return RoutingResult(
+                success=False,
+                net=net,
+                strategy_used=RoutingStrategy.HIERARCHICAL_DIFF_PAIR,
+                error_message="Insufficient pads for hierarchical routing",
+            )
+
+        if self._hierarchical is None:
+            width = getattr(self.pcb, "width", 65.0)
+            height = getattr(self.pcb, "height", 56.0)
+
+            # Build component data from available pads
+            components_by_ref: dict[str, dict] = {}
+            net_map: dict[str, int] = {}
+
+            for pad in pads:
+                ref = pad.ref or "U1"
+                if ref not in components_by_ref:
+                    components_by_ref[ref] = {
+                        "ref": ref,
+                        "x": pad.x,
+                        "y": pad.y,
+                        "rotation": 0,
+                        "pads": [],
+                    }
+                comp = components_by_ref[ref]
+                comp["pads"].append(
+                    {
+                        "number": pad.pin or str(len(comp["pads"]) + 1),
+                        "x": pad.x - comp["x"],
+                        "y": pad.y - comp["y"],
+                        "net": pad.net_name or f"Net_{pad.net}",
+                        "through_hole": pad.through_hole,
+                    }
+                )
+                net_name = pad.net_name or f"Net_{pad.net}"
+                if net_name not in net_map:
+                    net_map[net_name] = pad.net
+
+            # Skip power nets if differential pair intent
+            skip_nets: list[str] = []
+            if intent and hasattr(intent, "skip_nets"):
+                skip_nets = intent.skip_nets
+
+            self._hierarchical = AdaptiveAutorouter(
+                width=width,
+                height=height,
+                components=list(components_by_ref.values()),
+                net_map=net_map,
+                rules=self.rules,
+                verbose=False,
+                skip_nets=skip_nets,
+            )
+
+        adaptive_result = self._hierarchical.route()
+
+        # Convert AdaptiveAutorouter result to orchestrator RoutingResult
+        total_length = 0.0
+        via_count = 0
+        all_segments: list = []
+        all_vias: list = []
+
+        for route in adaptive_result.routes:
+            for seg in route.segments:
+                length = math.sqrt(
+                    (seg.x2 - seg.x1) ** 2 + (seg.y2 - seg.y1) ** 2
+                )
+                total_length += length
+                all_segments.append(seg)
+            via_count += len(route.vias)
+            all_vias.extend(route.vias)
+
         return RoutingResult(
-            success=True,
+            success=adaptive_result.converged,
             net=net,
             strategy_used=RoutingStrategy.HIERARCHICAL_DIFF_PAIR,
+            segments=all_segments,
+            vias=all_vias,
             metrics=RoutingMetrics(
-                total_length_mm=15.0,
-                via_count=2,
-                layer_changes=1,
+                total_length_mm=total_length,
+                via_count=via_count,
+                layer_changes=via_count,
             ),
-            warnings=["Hierarchical routing: placeholder implementation"],
         )
 
     def _route_subgrid_adaptive(
@@ -497,6 +670,10 @@ class RoutingOrchestrator:
     ) -> RoutingResult:
         """Execute routing with via conflict resolution.
 
+        Detects vias from other nets that block access to this net's pads,
+        resolves them using relocation (falling back to rip-reroute), then
+        routes the net using the global router.
+
         Args:
             net: Net identifier
             pads: List of pads
@@ -504,18 +681,73 @@ class RoutingOrchestrator:
         Returns:
             RoutingResult after via conflict resolution
         """
-        # Placeholder implementation
-        return RoutingResult(
-            success=True,
-            net=net,
-            strategy_used=RoutingStrategy.VIA_CONFLICT_RESOLUTION,
-            metrics=RoutingMetrics(
-                total_length_mm=11.0,
-                via_count=2,
-                layer_changes=1,
-            ),
-            warnings=["Via conflict resolution: placeholder implementation"],
+        if pads is None or len(pads) < 2:
+            return RoutingResult(
+                success=False,
+                net=net,
+                strategy_used=RoutingStrategy.VIA_CONFLICT_RESOLUTION,
+                error_message="Insufficient pads for via conflict resolution routing",
+            )
+
+        manager = self.via_manager
+        if manager is None:
+            # No grid available, fall back to global routing
+            logger.warning(
+                "Via conflict resolution requested but no routing grid available, "
+                "falling back to global routing"
+            )
+            result = self._route_global(net, pads)
+            result.strategy_used = RoutingStrategy.VIA_CONFLICT_RESOLUTION
+            result.warnings.append(
+                "Via conflict resolution unavailable (no routing grid); "
+                "used global routing as fallback"
+            )
+            return result
+
+        # Find all blocking vias for this net's pads
+        net_id = net if isinstance(net, int) else 0
+        all_conflicts = []
+        for pad in pads:
+            conflicts = manager.find_blocking_vias(pad=pad, pad_net=net_id)
+            all_conflicts.extend(conflicts)
+
+        # Deduplicate conflicts by via position
+        seen_positions: set[tuple[float, float]] = set()
+        unique_conflicts = []
+        for conflict in all_conflicts:
+            key = (round(conflict.via.x, 4), round(conflict.via.y, 4))
+            if key not in seen_positions:
+                seen_positions.add(key)
+                unique_conflicts.append(conflict)
+
+        # Resolve conflicts using RELOCATE strategy (with fallback to rip-reroute)
+        resolutions = []
+        if unique_conflicts:
+            resolutions = manager.resolve_conflicts(
+                unique_conflicts,
+                strategy=ViaConflictStrategy.RELOCATE,
+            )
+            logger.info(
+                "Via conflict resolution: %d conflicts found, %d resolutions attempted",
+                len(unique_conflicts),
+                len(resolutions),
+            )
+
+        # Route the net after conflict resolution
+        result = self._route_global(net, pads)
+        result.strategy_used = RoutingStrategy.VIA_CONFLICT_RESOLUTION
+
+        # Add via conflict resolution info to result
+        successful_resolutions = sum(
+            1 for r in resolutions if getattr(r, "success", False)
         )
+        if unique_conflicts:
+            result.warnings.append(
+                f"Via conflict resolution: {len(unique_conflicts)} conflicts found, "
+                f"{successful_resolutions} resolved"
+            )
+
+        return result
 
     def _route_full_pipeline(
         self, net: str | int, intent: NetIntent | None, pads: list[Pad] | None
@@ -548,27 +780,86 @@ class RoutingOrchestrator:
     def _apply_clearance_repair(self, result: RoutingResult) -> int:
         """Apply automatic clearance repair to fix violations.
 
+        Uses ClearanceRepairer to compute minimal displacements for traces
+        and vias that violate clearance rules. Requires a PCB file path
+        to be available on the PCB object.
+
         Args:
             result: RoutingResult to repair (modified in place)
 
         Returns:
             Number of repairs applied
         """
-        # Placeholder - real implementation would use ClearanceRepairer
-        repairs_applied = len(result.violations)
+        if not result.violations:
+            return 0
 
-        if repairs_applied > 0:
-            result.repair_actions.append(
-                RepairAction(
-                    action_type="nudge",
-                    target=f"{repairs_applied} clearance violations",
-                    displacement_mm=0.05,
-                    success=True,
-                    notes="Placeholder: automatic clearance repair",
-                )
+        pcb_path = getattr(self.pcb, "path", None)
+        if pcb_path is None:
+            logger.warning(
+                "Clearance repair requested but no PCB file path available"
             )
+            return 0
 
-        return repairs_applied
+        from ..core.types import Severity
+        from ..drc.repair_clearance import ClearanceRepairer
+        from ..drc.report import DRCReport
+        from ..drc.violation import DRCViolation as DrcViolation
+        from ..drc.violation import Location, ViolationType
+
+        # Convert orchestrator violations to DRC report format
+        drc_violations = []
+        for v in result.violations:
+            drc_v = DrcViolation(
+                type=ViolationType.from_string(v.violation_type),
+                type_str=v.violation_type,
+                severity=(
+                    Severity.ERROR if v.severity == "error" else Severity.WARNING
+                ),
+                message=v.description,
+                locations=[
+                    Location(x_mm=v.location[0], y_mm=v.location[1]),
+                ],
+                nets=list(v.affected_nets),
+            )
+            drc_violations.append(drc_v)
+
+        report = DRCReport(
+            source_file=str(pcb_path),
+            created_at=None,
+            pcb_name="",
+            violations=drc_violations,
+        )
+
+        try:
+            repairer = ClearanceRepairer(pcb_path)
+            repair_result = repairer.repair_from_report(report)
+
+            # Convert repair nudges to RepairAction objects
+            for nudge in repair_result.nudges:
+                result.repair_actions.append(
+                    RepairAction(
+                        action_type="nudge",
+                        target=(
+                            f"{nudge.object_type} [{nudge.net_name}] "
+                            f"at ({nudge.x:.4f}, {nudge.y:.4f})"
+                        ),
+                        displacement_mm=nudge.displacement_mm,
+                        success=True,
+                        notes=(
+                            f"Clearance {nudge.old_clearance_mm:.4f} "
+                            f"-> {nudge.new_clearance_mm:.4f}mm"
+                        ),
+                    )
+                )
+
+            if repair_result.repaired > 0:
+                repairer.save()
+
+            return repair_result.repaired
+
+        except Exception as e:
+            logger.warning("Clearance repair failed: %s", e)
+            return 0
 
     def _suggest_alternatives(self, failed_strategy: RoutingStrategy) -> list[AlternativeStrategy]:
         """Suggest alternative strategies when a strategy fails.
@@ -610,8 +901,11 @@ class RoutingOrchestrator:
         """Lazy-initialized global router instance."""
         if self._global_router is None:
             if self._region_graph is None:
-                # Placeholder - real implementation would extract board dimensions
-                self._region_graph = RegionGraph(board_width=65, board_height=56)
+                board_width = getattr(self.pcb, "width", 65.0)
+                board_height = getattr(self.pcb, "height", 56.0)
+                self._region_graph = RegionGraph(
+                    board_width=board_width, board_height=board_height
+                )
             self._global_router = GlobalRouter(
                 region_graph=self._region_graph,
                 corridor_width=self.corridor_width,
@@ -619,17 +913,25 @@ class RoutingOrchestrator:
         return self._global_router
 
     @property
-    def escape_router(self) -> EscapeRouter:
-        """Lazy-initialized escape router instance."""
+    def escape_router(self) -> EscapeRouter | None:
+        """Lazy-initialized escape router instance.
+
+        Returns None if the PCB does not expose a routing grid.
+        """
         if self._escape is None:
-            # Placeholder - real implementation would need grid and rules
-            pass
-        return self._escape  # type: ignore
+            grid = getattr(self.pcb, "grid", None)
+            if grid is not None:
+                self._escape = EscapeRouter(grid=grid, rules=self.rules)
+        return self._escape
 
     @property
-    def via_manager(self) -> ViaConflictManager:
-        """Lazy-initialized via conflict manager instance."""
+    def via_manager(self) -> ViaConflictManager | None:
+        """Lazy-initialized via conflict manager instance.
+
+        Returns None if the PCB does not expose a routing grid.
+        """
         if self._via_manager is None:
-            # Placeholder - real implementation would need grid and rules
-            pass
-        return self._via_manager  # type: ignore
+            grid = getattr(self.pcb, "grid", None)
+            if grid is not None:
+                self._via_manager = ViaConflictManager(grid=grid, rules=self.rules)
+        return self._via_manager
